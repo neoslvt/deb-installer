@@ -1,0 +1,1 @@
+# TODO: Installation script that the user could copy & paste from the README.md

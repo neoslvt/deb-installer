@@ -11,15 +11,23 @@
 #include <gtkmm/overlay.h>
 #include <gtkmm/scrolledwindow.h>
 #include <gtkmm/checkbutton.h>
+#include <gtkmm/textview.h>
+#include <gtkmm/textbuffer.h>
 #include <glibmm/main.h>
+#include <glibmm/dispatcher.h>
 #include <iostream>
 #include <filesystem>
+#include <thread>
+#include <mutex>
+#include <sstream>
+#include <cstdio>
+#include <regex>
 
 namespace fs = std::filesystem;
 
 class InstallerWindow : public Gtk::Window {
 public:
-    InstallerWindow(std::string path) : m_deb_path(path) {
+    InstallerWindow(std::string path) : m_deb_path(path), m_progress_dispatcher(), m_completion_dispatcher(), m_operation_success(false), m_current_progress(0.0) {
         set_title("Software Setup Wizard");
         set_default_size(700, 500);
 
@@ -73,6 +81,7 @@ public:
 
         m_btn_back.set_label("Back");
         m_btn_back.set_sensitive(false);
+        m_btn_back.set_visible(false);
         m_btn_back.signal_clicked().connect(sigc::mem_fun(*this, &InstallerWindow::on_back_clicked));
 
         m_btn_next.set_label(m_license_text.empty() ? (m_is_installed ? "Reinstall" : "Install") : "Next");
@@ -91,10 +100,18 @@ public:
         m_button_box.append(m_btn_cancel);
         main_vbox->append(m_button_box);
 
+        m_progress_dispatcher.connect(sigc::mem_fun(*this, &InstallerWindow::update_progress_from_thread));
+        m_completion_dispatcher.connect(sigc::mem_fun(*this, &InstallerWindow::update_completion_from_thread));
+
         apply_custom_style();
     }
 
-    ~InstallerWindow() { if (!m_extracted_icon_path.empty()) fs::remove(m_extracted_icon_path); }
+    ~InstallerWindow() {
+        if (m_install_thread.joinable()) {
+            m_install_thread.join();
+        }
+        if (!m_extracted_icon_path.empty()) fs::remove(m_extracted_icon_path);
+    }
 
 private:
     void create_welcome_page() {
@@ -131,9 +148,19 @@ private:
 
     void create_install_page() {
         auto box = Gtk::make_managed<Gtk::Box>(Gtk::Orientation::VERTICAL);
-        box->set_margin(30); box->set_valign(Gtk::Align::CENTER); box->set_spacing(15);
+        box->set_margin(30);
+        box->set_vexpand(true);
+        box->set_spacing(15);
         m_progress_label.set_text("Waiting for authorization...");
-        box->append(m_progress_label); box->append(m_progress_bar);
+        box->append(m_progress_label);
+        box->append(m_progress_bar);
+        m_error_scroll.set_vexpand(true);
+        m_error_scroll.set_visible(false);
+        m_error_text.set_editable(false);
+        m_error_text.set_monospace(true);
+        m_error_text.set_margin(10);
+        m_error_scroll.set_child(m_error_text);
+        box->append(m_error_scroll);
         m_stack.add(*box, "progress");
     }
 
@@ -145,6 +172,9 @@ private:
                 m_btn_next.set_label("Next");
                 m_btn_next.set_sensitive(m_check_accept.get_active());
                 m_btn_back.set_sensitive(true);
+                m_btn_back.set_visible(true);
+
+                
             } else { start_install_sequence(); }
         } else if (current == "license") {
             start_install_sequence();
@@ -159,46 +189,203 @@ private:
         m_btn_back.set_sensitive(false);
         m_btn_uninstall.set_sensitive(false);
         m_progress_label.set_text("Authenticating...");
-        m_progress_bar.pulse();
+        m_progress_bar.set_fraction(0.0);
+        m_error_scroll.set_visible(false);
+        m_command_output.clear();
+        m_current_progress = 0.0;
+        m_progress_status = "Authenticating...";
+        m_btn_cancel.set_visible(false);
+        m_btn_next.set_label("Finish");
 
-        Glib::signal_idle().connect(sigc::mem_fun(*this, &InstallerWindow::execute_install_command));
+        if (m_install_thread.joinable()) {
+            m_install_thread.join();
+        }
+        m_install_thread = std::thread(&InstallerWindow::run_install_thread, this);
     }
 
-    bool execute_install_command() {
+    void run_install_thread() {
         std::string abs_path = fs::absolute(m_deb_path).string();
-        std::string cmd = "pkexec apt-get install -y --reinstall " + abs_path;
+        std::string cmd = "pkexec apt-get install -y --reinstall " + abs_path + " 2>&1";
         
-        if (std::system(cmd.c_str()) == 0) {
-            m_progress_label.set_text("Installation Complete!");
-            m_progress_bar.set_fraction(1.0);
-            m_btn_next.set_label("Finish");
-            m_btn_next.set_sensitive(true);
-        } else {
-            m_progress_label.set_text("Installation cancelled or failed.");
-            m_btn_cancel.set_sensitive(true);
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            {
+                std::lock_guard<std::mutex> lock(m_output_mutex);
+                m_operation_success = false;
+                m_command_output = "Failed to start installation process.";
+            }
+            m_completion_dispatcher.emit();
+            return;
         }
-        return false;
+
+        char buffer[1024];
+        std::string line;
+        double last_progress = -1.0;
+        std::regex progress_regex(R"(\[?\s*(\d+)%\s*\]?)");
+
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            line = buffer;
+            {
+                std::lock_guard<std::mutex> lock(m_output_mutex);
+                m_command_output += line;
+            }
+
+            std::smatch match;
+            if (std::regex_search(line, match, progress_regex)) {
+                double progress = std::stod(match[1].str()) / 100.0;
+                if (progress - last_progress >= 0.01 || progress == 1.0) {
+                    last_progress = progress;
+                    {
+                        std::lock_guard<std::mutex> lock(m_output_mutex);
+                        m_current_progress = progress;
+                        if (line.find("Reading") != std::string::npos) {
+                            m_progress_status = "Reading package lists...";
+                        } else if (line.find("Unpacking") != std::string::npos) {
+                            m_progress_status = "Unpacking packages...";
+                        } else if (line.find("Setting up") != std::string::npos) {
+                            m_progress_status = "Setting up packages...";
+                        } else if (line.find("Processing") != std::string::npos) {
+                            m_progress_status = "Processing triggers...";
+                        } else {
+                            m_progress_status = "Installing...";
+                        }
+                    }
+                    m_progress_dispatcher.emit();
+                }
+            } else if (line.find("Reading") != std::string::npos || line.find("Preparing") != std::string::npos) {
+                {
+                    std::lock_guard<std::mutex> lock(m_output_mutex);
+                    m_progress_status = "Preparing installation...";
+                }
+                m_progress_dispatcher.emit();
+            }
+        }
+
+        int exit_code = pclose(pipe);
+        {
+            std::lock_guard<std::mutex> lock(m_output_mutex);
+            m_operation_success = (exit_code == 0);
+        }
+        m_completion_dispatcher.emit();
     }
 
     void on_uninstall_clicked() {
         m_stack.set_visible_child("progress");
         m_btn_next.set_sensitive(false);
         m_btn_back.set_sensitive(false);
+        m_btn_cancel.set_sensitive(false);
         m_progress_label.set_text("Authenticating removal...");
-        m_progress_bar.pulse();
+        m_progress_bar.set_fraction(0.0);
+        m_error_scroll.set_visible(false);
+        m_command_output.clear();
+        m_current_progress = 0.0;
+        m_progress_status = "Authenticating removal...";
+        m_btn_uninstall.set_visible(false);
+        m_btn_cancel.set_visible(false);
+        m_btn_next.set_label("Finish");
 
-        Glib::signal_idle().connect([this]() -> bool {
-            if (std::system(("pkexec apt-get remove -y " + m_pkg_name).c_str()) == 0) {
-                m_progress_label.set_text("Successfully removed.");
-                m_progress_bar.set_fraction(1.0);
-                m_btn_next.set_label("Finish");
-                m_btn_next.set_sensitive(true);
-            } else {
-                m_progress_label.set_text("Removal failed.");
-                m_btn_cancel.set_sensitive(true);
+        
+        if (m_install_thread.joinable()) {
+            m_install_thread.join();
+        }
+        m_install_thread = std::thread(&InstallerWindow::run_uninstall_thread, this);
+    }
+
+    void run_uninstall_thread() {
+        std::string cmd = "pkexec apt-get remove -y " + m_pkg_name + " 2>&1";
+        
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            {
+                std::lock_guard<std::mutex> lock(m_output_mutex);
+                m_operation_success = false;
+                m_command_output = "Failed to start removal process.";
             }
-            return false;
-        });
+            m_completion_dispatcher.emit();
+            return;
+        }
+
+        char buffer[1024];
+        std::string line;
+        double last_progress = -1.0;
+        std::regex progress_regex(R"(\[?\s*(\d+)%\s*\]?)");
+
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            line = buffer;
+            {
+                std::lock_guard<std::mutex> lock(m_output_mutex);
+                m_command_output += line;
+            }
+
+            std::smatch match;
+            if (std::regex_search(line, match, progress_regex)) {
+                double progress = std::stod(match[1].str()) / 100.0;
+                if (progress - last_progress >= 0.01 || progress == 1.0) {
+                    last_progress = progress;
+                    {
+                        std::lock_guard<std::mutex> lock(m_output_mutex);
+                        m_current_progress = progress;
+                        if (line.find("Reading") != std::string::npos) {
+                            m_progress_status = "Reading package lists...";
+                        } else if (line.find("Removing") != std::string::npos) {
+                            m_progress_status = "Removing packages...";
+                        } else if (line.find("Processing") != std::string::npos) {
+                            m_progress_status = "Processing triggers...";
+                        } else {
+                            m_progress_status = "Uninstalling...";
+                        }
+                    }
+                    m_progress_dispatcher.emit();
+                }
+            } else if (line.find("Reading") != std::string::npos || line.find("Preparing") != std::string::npos) {
+                {
+                    std::lock_guard<std::mutex> lock(m_output_mutex);
+                    m_progress_status = "Preparing removal...";
+                }
+                m_progress_dispatcher.emit();
+            }
+        }
+
+        int exit_code = pclose(pipe);
+        {
+            std::lock_guard<std::mutex> lock(m_output_mutex);
+            m_operation_success = (exit_code == 0);
+            if (m_operation_success) {
+                m_progress_status = "Successfully removed.";
+            } else {
+                m_progress_status = "Removal failed.";
+            }
+        }
+        m_completion_dispatcher.emit();
+    }
+
+    void update_progress_from_thread() {
+        std::lock_guard<std::mutex> lock(m_output_mutex);
+        m_progress_bar.set_fraction(m_current_progress);
+        if (!m_progress_status.empty()) {
+            m_progress_label.set_text(m_progress_status);
+        }
+    }
+
+    void update_completion_from_thread() {
+        std::lock_guard<std::mutex> lock(m_output_mutex);
+        if (m_operation_success) {
+            m_progress_label.set_text(m_progress_status.empty() ? "Operation Complete!" : m_progress_status);
+            m_progress_status = "Operation Complete!";
+            m_progress_bar.set_fraction(1.0);
+            m_btn_next.set_label("Finish");
+            m_btn_next.set_visible(true);
+            m_btn_next.set_sensitive(true);
+        } else {
+            m_progress_label.set_text(m_progress_status.empty() ? "Operation cancelled or failed." : m_progress_status);
+            auto buffer = m_error_text.get_buffer();
+            buffer->set_text(m_command_output);
+            m_error_scroll.set_visible(true);
+            m_btn_cancel.set_sensitive(true);
+        }
+        m_btn_cancel.set_visible(false);
+        m_btn_back.set_visible(false);
+        m_btn_uninstall.set_visible(false);
     }
 
     void on_back_clicked() {
@@ -208,6 +395,7 @@ private:
             m_btn_next.set_label(m_license_text.empty() ? "Install" : "Next");
             m_btn_next.set_sensitive(true);
             m_btn_back.set_sensitive(false);
+            m_btn_back.set_visible(false);
         }
     }
 
@@ -261,6 +449,16 @@ private:
     Gtk::Label m_progress_label;
     Gtk::Image m_sidebar_img;
     Gtk::CheckButton m_check_accept;
+    Glib::Dispatcher m_progress_dispatcher;
+    Glib::Dispatcher m_completion_dispatcher;
+    std::thread m_install_thread;
+    std::mutex m_output_mutex;
+    std::string m_command_output;
+    Gtk::TextView m_error_text;
+    Gtk::ScrolledWindow m_error_scroll;
+    bool m_operation_success;
+    double m_current_progress;
+    std::string m_progress_status;
 };
 
 class WizardApp : public Gtk::Application {
